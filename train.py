@@ -85,6 +85,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
+    train_cameras = scene.getTrainCameras()
+    view_last_losses = [float('inf')] * len(train_cameras)
+    view_selection_counts = [0] * len(train_cameras)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -93,7 +96,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -121,11 +123,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        max_loss = max(view_last_losses)
+        tolerance = 1e-6
+        candidate_indices = [idx for idx, value in enumerate(view_last_losses) if abs(max_loss - value) <= tolerance]
+        selected_view_idx = candidate_indices[randint(0, len(candidate_indices) - 1)]
+        viewpoint_cam = train_cameras[selected_view_idx]
+        view_selection_counts[selected_view_idx] += 1
 
         # Render
         if (iteration - 1) == debug_from:
@@ -143,12 +146,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+        loss_value = loss.item()
 
         loss.backward()
         
         iter_end.record()
 
         with torch.no_grad():
+            view_last_losses[selected_view_idx] = loss_value
+
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
 
@@ -185,6 +191,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    if train_cameras:
+        view_selection_stats = [
+            {
+                "index": idx,
+                "image_name": getattr(train_cameras[idx], "image_name", None),
+                "count": view_selection_counts[idx],
+            }
+            for idx in range(len(train_cameras))
+        ]
+        view_selection_stats.sort(key=lambda item: item["count"], reverse=True)
+        stats_path = os.path.join(dataset.model_path, "view_selection_stats.json")
+        with open(stats_path, "w") as stats_file:
+            json.dump(view_selection_stats, stats_file, indent=2)
+        if logger:
+            logger.info(f"Saved view selection stats to {stats_path}")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
