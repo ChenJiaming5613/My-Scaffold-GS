@@ -11,6 +11,7 @@
 
 import os
 import numpy as np
+import math
 
 import subprocess
 cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
@@ -125,7 +126,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         max_loss = max(view_last_losses)
         tolerance = 1e-6
-        candidate_indices = [idx for idx, value in enumerate(view_last_losses) if abs(max_loss - value) <= tolerance]
+        candidate_indices = []
+        for idx, value in enumerate(view_last_losses):
+            if not math.isfinite(max_loss):
+                if not math.isfinite(value):
+                    candidate_indices.append(idx)
+            elif abs(max_loss - value) <= tolerance:
+                candidate_indices.append(idx)
+
+        if not candidate_indices:
+            candidate_indices = [idx for idx, value in enumerate(view_last_losses) if value == max_loss]
+        if not candidate_indices:
+            candidate_indices = list(range(len(train_cameras)))
         selected_view_idx = candidate_indices[randint(0, len(candidate_indices) - 1)]
         viewpoint_cam = train_cameras[selected_view_idx]
         view_selection_counts[selected_view_idx] += 1
