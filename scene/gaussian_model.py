@@ -604,7 +604,7 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
     
-    def anchor_growing(self, grads, threshold, offset_mask):
+    def anchor_growing(self, grads, threshold, offset_mask, scene_extent):
         ## 
         init_length = self.get_anchor.shape[0]*self.n_offsets
         for i in range(self.update_depth):
@@ -627,7 +627,7 @@ class GaussianModel:
                 candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device='cuda')], dim=0)
 
             all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)
-            total_offset_scales = (self.get_scaling[:,3:].unsqueeze(1) * self.get_offset_scaling).view(-1, 3)
+            total_offset_scales = self.get_offset_scaling.view(-1, 3)
             candidate_indices = candidate_mask.nonzero(as_tuple=False).squeeze(1)
             
             # assert self.update_init_factor // (self.update_hierachy_factor**i) > 0
@@ -663,7 +663,8 @@ class GaussianModel:
             
             if candidate_anchor.shape[0] > 0:
                 split_log = math.log(self.anchor_split_shrink_factor)
-                split_threshold = cur_size
+                # split_threshold = cur_size * self.percent_dense
+                split_threshold = self.percent_dense * scene_extent
                 if candidate_indices.numel() > 0:
                     candidate_scale_norm = total_offset_scales[candidate_indices].amax(dim=-1)
                     split_offset_mask = candidate_scale_norm > split_threshold
@@ -728,14 +729,14 @@ class GaussianModel:
                 
 
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
+    def adjust_anchor(self, scene_extent, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
         
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        self.anchor_growing(grads_norm, grad_threshold, offset_mask, scene_extent)
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
