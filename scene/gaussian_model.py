@@ -10,6 +10,7 @@
 #
 
 import torch
+import math
 from functools import reduce
 import numpy as np
 from torch_scatter import scatter_max
@@ -94,6 +95,7 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.anchor_split_shrink_factor = 1.6
         self.setup_functions()
 
         if self.use_feat_bank:
@@ -625,6 +627,8 @@ class GaussianModel:
                 candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device='cuda')], dim=0)
 
             all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)
+            total_offset_scales = (self.get_scaling[:,3:].unsqueeze(1) * self.get_offset_scaling).view(-1, 3)
+            candidate_indices = candidate_mask.nonzero(as_tuple=False).squeeze(1)
             
             # assert self.update_init_factor // (self.update_hierachy_factor**i) > 0
             # size_factor = min(self.update_init_factor // (self.update_hierachy_factor**i), 1)
@@ -658,6 +662,24 @@ class GaussianModel:
 
             
             if candidate_anchor.shape[0] > 0:
+                split_log = math.log(self.anchor_split_shrink_factor)
+                split_threshold = cur_size
+                if candidate_indices.numel() > 0:
+                    candidate_scale_norm = total_offset_scales[candidate_indices].amax(dim=-1)
+                    split_offset_mask = candidate_scale_norm > split_threshold
+                    if split_offset_mask.any():
+                        affected_indices = candidate_indices[split_offset_mask]
+                        with torch.no_grad():
+                            flat_offset_scaling = self._offset_scaling.view(-1, 3)
+                            flat_offset_scaling[affected_indices] -= split_log
+                    scale_per_candidate, _ = scatter_max(candidate_scale_norm.unsqueeze(-1), inverse_indices, dim=0)
+                    scale_per_candidate = scale_per_candidate.squeeze(-1)[remove_duplicates]
+                else:
+                    candidate_scale_norm = torch.empty(0, device=candidate_anchor.device)
+                    split_offset_mask = torch.zeros(0, dtype=torch.bool, device=candidate_anchor.device)
+                    scale_per_candidate = torch.zeros(candidate_anchor.shape[0], device=candidate_anchor.device)
+                new_anchor_split_mask = scale_per_candidate > split_threshold
+
                 new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*cur_size # *0.05
                 new_scaling = torch.log(new_scaling)
                 new_rotation = torch.zeros([candidate_anchor.shape[0], 4], device=candidate_anchor.device).float()
@@ -671,6 +693,8 @@ class GaussianModel:
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
                 new_offset_scaling = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
+                if new_anchor_split_mask.any():
+                    new_offset_scaling[new_anchor_split_mask] = -split_log
 
                 d = {
                     "anchor": candidate_anchor,
