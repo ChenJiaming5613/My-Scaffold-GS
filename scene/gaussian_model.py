@@ -81,6 +81,7 @@ class GaussianModel:
         self.opacity_accum = torch.empty(0)
 
         self._scaling = torch.empty(0)
+        self._offset_scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
@@ -116,7 +117,7 @@ class GaussianModel:
         self.mlp_cov = nn.Sequential(
             nn.Linear(feat_dim+3+self.cov_dist_dim, feat_dim),
             nn.ReLU(True),
-            nn.Linear(feat_dim, 7*self.n_offsets),
+            nn.Linear(feat_dim, 4*self.n_offsets),
         ).cuda()
 
         self.color_dist_dim = 1 if self.add_color_dist else 0
@@ -189,6 +190,10 @@ class GaussianModel:
         return 1.0*self.scaling_activation(self._scaling)
     
     @property
+    def get_offset_scaling(self):
+        return 1.0*self.scaling_activation(self._offset_scaling)
+    
+    @property
     def get_featurebank_mlp(self):
         return self.mlp_feature_bank
     
@@ -252,6 +257,7 @@ class GaussianModel:
         fused_point_cloud = torch.tensor(np.asarray(points)).float().cuda()
         offsets = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3)).float().cuda()
         anchors_feat = torch.zeros((fused_point_cloud.shape[0], self.feat_dim)).float().cuda()
+        offset_scales = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3)).float().cuda()
         
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
@@ -267,6 +273,7 @@ class GaussianModel:
         self._offset = nn.Parameter(offsets.requires_grad_(True))
         self._anchor_feat = nn.Parameter(anchors_feat.requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._offset_scaling = nn.Parameter(offset_scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
@@ -290,6 +297,7 @@ class GaussianModel:
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                {'params': [self._offset_scaling], 'lr': training_args.scaling_lr, "name": "offset_scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
                 
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
@@ -305,6 +313,7 @@ class GaussianModel:
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                {'params': [self._offset_scaling], 'lr': training_args.scaling_lr, "name": "offset_scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
 
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
@@ -319,6 +328,7 @@ class GaussianModel:
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                {'params': [self._offset_scaling], 'lr': training_args.scaling_lr, "name": "offset_scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
 
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
@@ -391,6 +401,8 @@ class GaussianModel:
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         for i in range(self._offset.shape[1]*self._offset.shape[2]):
             l.append('f_offset_{}'.format(i))
+        for i in range(self._offset_scaling.shape[1]*self._offset_scaling.shape[2]):
+            l.append('f_offset_scale_{}'.format(i))
         for i in range(self._anchor_feat.shape[1]):
             l.append('f_anchor_feat_{}'.format(i))
         l.append('opacity')
@@ -407,6 +419,7 @@ class GaussianModel:
         normals = np.zeros_like(anchor)
         anchor_feat = self._anchor_feat.detach().cpu().numpy()
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        offset_scale = self._offset_scaling.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
@@ -414,7 +427,7 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((anchor, normals, offset, offset_scale, anchor_feat, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -446,21 +459,30 @@ class GaussianModel:
         for idx, attr_name in enumerate(anchor_feat_names):
             anchor_feats[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
 
-        offset_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_offset")]
+        offset_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_offset_") and not p.name.startswith("f_offset_scale_")]
         offset_names = sorted(offset_names, key = lambda x: int(x.split('_')[-1]))
         offsets = np.zeros((anchor.shape[0], len(offset_names)))
         for idx, attr_name in enumerate(offset_names):
             offsets[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         offsets = offsets.reshape((offsets.shape[0], 3, -1))
-        
+        offset_scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_offset_scale_")]
+        offset_scale_names = sorted(offset_scale_names, key = lambda x: int(x.split('_')[-1]))
+        if len(offset_scale_names) > 0:
+            offset_scales = np.zeros((anchor.shape[0], len(offset_scale_names)))
+            for idx, attr_name in enumerate(offset_scale_names):
+                offset_scales[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+            offset_scales = offset_scales.reshape((offset_scales.shape[0], 3, -1))
+        else:
+            offset_scales = np.zeros_like(offsets)
+
         self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._offset_scaling = nn.Parameter(torch.tensor(offset_scales, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._anchor = nn.Parameter(torch.tensor(anchor, dtype=torch.float, device="cuda").requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -576,6 +598,7 @@ class GaussianModel:
         self._anchor_feat = optimizable_tensors["anchor_feat"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
+        self._offset_scaling = optimizable_tensors["offset_scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
     
@@ -647,6 +670,7 @@ class GaussianModel:
                 new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
+                new_offset_scaling = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
                 d = {
                     "anchor": candidate_anchor,
@@ -654,6 +678,7 @@ class GaussianModel:
                     "rotation": new_rotation,
                     "anchor_feat": new_feat,
                     "offset": new_offsets,
+                    "offset_scaling": new_offset_scaling,
                     "opacity": new_opacities,
                 }
                 
@@ -674,6 +699,7 @@ class GaussianModel:
                 self._rotation = optimizable_tensors["rotation"]
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
                 self._offset = optimizable_tensors["offset"]
+                self._offset_scaling = optimizable_tensors["offset_scaling"]
                 self._opacity = optimizable_tensors["opacity"]
                 
 

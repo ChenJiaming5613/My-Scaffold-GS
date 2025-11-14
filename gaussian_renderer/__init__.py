@@ -24,6 +24,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     anchor = pc.get_anchor[visible_mask]
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
+    grid_offset_scaling = pc.get_offset_scaling[visible_mask]
 
     ## get view properties for anchor
     ob_view = anchor - viewpoint_camera.camera_center
@@ -82,28 +83,32 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # get offset's cov
     if pc.add_cov_dist:
-        scale_rot = pc.get_cov_mlp(cat_local_view)
+        rot_feat = pc.get_cov_mlp(cat_local_view)
     else:
-        scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
-    scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7]) # [mask]
+        rot_feat = pc.get_cov_mlp(cat_local_view_wodist)
+    rot_feat = rot_feat.reshape([anchor.shape[0]*pc.n_offsets, 4])
     
     # offsets
     offsets = grid_offsets.view([-1, 3]) # [mask]
     
     # combine for parallel masking
-    concatenated = torch.cat([grid_scaling, anchor], dim=-1)
-    concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
-    masked = concatenated_all[mask]
-    scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
+    anchor_repeat = repeat(anchor, 'n c -> (n k) c', k=pc.n_offsets)
+    scaling_repeat = repeat(grid_scaling, 'n c -> (n k) c', k=pc.n_offsets)
+    offset_scaling_repeat = grid_offset_scaling.view(-1, 3)
+    offsets = offsets[mask]
+    scaling_repeat = scaling_repeat[mask]
+    offset_scaling_repeat = offset_scaling_repeat[mask]
+    anchor_repeat = anchor_repeat[mask]
+    color = color[mask]
+    rot_feat = rot_feat[mask]
     
     # post-process cov
-    scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
-    rot = pc.rotation_activation(scale_rot[:,3:7])
-    
+    scaling = scaling_repeat[:,3:] * offset_scaling_repeat
+    rot = pc.rotation_activation(rot_feat)
+
     # post-process offsets to get centers for gaussians
     offsets = offsets * scaling_repeat[:,:3]
-    xyz = repeat_anchor + offsets
+    xyz = anchor_repeat + offsets
 
     if is_training:
         return xyz, color, opacity, scaling, rot, neural_opacity, mask
