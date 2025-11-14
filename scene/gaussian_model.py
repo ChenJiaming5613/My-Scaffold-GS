@@ -663,8 +663,8 @@ class GaussianModel:
             
             if candidate_anchor.shape[0] > 0:
                 split_log = math.log(self.anchor_split_shrink_factor)
-                # split_threshold = cur_size * self.percent_dense
-                split_threshold = self.percent_dense * scene_extent
+                split_threshold = self.percent_dense * cur_size
+                # split_threshold = self.percent_dense * scene_extent
                 if candidate_indices.numel() > 0:
                     candidate_scale_norm = total_offset_scales[candidate_indices].amax(dim=-1)
                     split_offset_mask = candidate_scale_norm > split_threshold
