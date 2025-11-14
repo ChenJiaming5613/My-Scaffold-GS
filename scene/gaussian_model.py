@@ -627,7 +627,7 @@ class GaussianModel:
                 candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device='cuda')], dim=0)
 
             all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)
-            total_offset_scales = self.get_offset_scaling.view(-1, 3)
+            total_offset_scales = (self.get_scaling[:,3:].unsqueeze(1) * self.get_offset_scaling).view(-1, 3)
             candidate_indices = candidate_mask.nonzero(as_tuple=False).squeeze(1)
             
             # assert self.update_init_factor // (self.update_hierachy_factor**i) > 0

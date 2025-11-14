@@ -103,7 +103,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     rot_feat = rot_feat[mask]
     
     # post-process cov
-    scaling = offset_scaling_repeat
+    scaling = scaling_repeat[:,3:] * offset_scaling_repeat
     rot = pc.rotation_activation(rot_feat)
 
     # post-process offsets to get centers for gaussians
