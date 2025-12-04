@@ -551,7 +551,7 @@ class GaussianModel:
                 if group['name'] == "scaling":
                     scales = group["params"][0]
                     temp = scales[:,3:]
-                    temp[temp>0.05] = 0.05
+                    # temp[temp>0.05] = 0.05
                     group["params"][0][:,3:] = temp
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
@@ -559,7 +559,7 @@ class GaussianModel:
                 if group['name'] == "scaling":
                     scales = group["params"][0]
                     temp = scales[:,3:]
-                    temp[temp>0.05] = 0.05
+                    # temp[temp>0.05] = 0.05
                     group["params"][0][:,3:] = temp
                 optimizable_tensors[group["name"]] = group["params"][0]
             
@@ -579,9 +579,13 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
     
-    def anchor_growing(self, grads, threshold, offset_mask):
+    def anchor_growing(self, grads, threshold, offset_mask, scene_extent=1.0, percent_dense=0.01):
         ## 
         init_length = self.get_anchor.shape[0]*self.n_offsets
+        
+        # Record anchors that need to be shrunk (Split operation)
+        anchors_to_shrink_mask = torch.zeros(self.get_anchor.shape[0], dtype=torch.bool, device="cuda")
+
         for i in range(self.update_depth):
             # update threshold
             cur_threshold = threshold*((self.update_hierachy_factor//2)**i)
@@ -590,9 +594,9 @@ class GaussianModel:
             candidate_mask = torch.logical_and(candidate_mask, offset_mask)
             
             # random pick
-            rand_mask = torch.rand_like(candidate_mask.float())>(0.5**(i+1))
-            rand_mask = rand_mask.cuda()
-            candidate_mask = torch.logical_and(candidate_mask, rand_mask)
+            # rand_mask = torch.rand_like(candidate_mask.float())>(0.5**(i+1))
+            # rand_mask = rand_mask.cuda()
+            # candidate_mask = torch.logical_and(candidate_mask, rand_mask)
             
             length_inc = self.get_anchor.shape[0]*self.n_offsets - init_length
             if length_inc == 0:
@@ -606,6 +610,7 @@ class GaussianModel:
             # assert self.update_init_factor // (self.update_hierachy_factor**i) > 0
             # size_factor = min(self.update_init_factor // (self.update_hierachy_factor**i), 1)
             size_factor = self.update_init_factor // (self.update_hierachy_factor**i)
+            # size_factor = 1.0 / (self.update_hierachy_factor**i)
             cur_size = self.voxel_size*size_factor
             
             grid_coords = torch.round(self.get_anchor / cur_size).int()
@@ -635,8 +640,56 @@ class GaussianModel:
 
             
             if candidate_anchor.shape[0] > 0:
-                new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*cur_size # *0.05
-                new_scaling = torch.log(new_scaling)
+                # === Split/Clone Logic Start ===
+                split_threshold = scene_extent * percent_dense
+                current_base_scales = self.get_scaling[:, 3:].max(dim=1)[0]
+                expanded_scales = current_base_scales.unsqueeze(1).repeat(1, self.n_offsets).view(-1)
+                
+                # Check candidate scales
+                selected_scales = expanded_scales[candidate_mask]
+                is_split = selected_scales > split_threshold
+                
+                # Mark old anchors to shrink
+                all_indices = torch.arange(candidate_mask.shape[0], device="cuda")
+                candidate_indices = all_indices[candidate_mask]
+                split_indices = candidate_indices[is_split]
+                split_anchor_indices = torch.div(split_indices, self.n_offsets, rounding_mode='trunc')
+                valid_shrink_indices = split_anchor_indices[split_anchor_indices < anchors_to_shrink_mask.shape[0]]
+                anchors_to_shrink_mask[valid_shrink_indices] = True
+
+                # === Init new anchor scaling based on OLD scaling ===
+                # Get the base scales of the triggering anchors (candidates)
+                # selected_scales is already the base scale of candidates: [M]
+                
+                # We need to map these scales to the unique new anchors
+                # inverse_indices maps from candidates to unique new anchors
+                
+                # Use scatter_max to propagate the MAX scale from candidates to the new anchor location
+                # (If multiple candidates spawn the same new anchor, we take the largest scale to be safe)
+                target_base_scales, _ = scatter_max(selected_scales.unsqueeze(1), inverse_indices.unsqueeze(1), dim=0)
+                target_base_scales = target_base_scales[remove_duplicates].squeeze(1) # [Num_New_Anchors]
+                
+                # Apply Split/Clone logic to the new scales
+                # If it was a split, divide by 1.6. If clone, keep as is (x1).
+                # Re-calculate split flag for unique anchors
+                is_split_float = is_split.float().unsqueeze(1)
+                unique_split_flag, _ = scatter_max(is_split_float, inverse_indices.unsqueeze(1), dim=0)
+                unique_split_flag = unique_split_flag[remove_duplicates].squeeze(1) > 0.5
+                
+                target_base_scales[unique_split_flag] /= 1.6
+                
+                # Apply Upper Bound: min(target_scale, cur_size)
+                # Ensure new anchors don't exceed the current voxel size, maintaining hierarchy consistency
+                target_base_scales = torch.min(target_base_scales, torch.tensor(cur_size, device="cuda").float())
+
+                # Create the full scaling tensor (replicate to 6 dims)
+                # Assuming isotropic initialization for simplicity, or we could copy full structure if complex
+                new_scaling = target_base_scales.unsqueeze(1).repeat([1, 6]) # [Num_New_Anchors, 6]
+                
+                # Convert to Log-Space for parameter storage
+                new_scaling = torch.log(new_scaling + 1e-6) # add epsilon for safety
+                # === End Init ===
+
                 new_rotation = torch.zeros([candidate_anchor.shape[0], 4], device=candidate_anchor.device).float()
                 new_rotation[:,0] = 1.0
 
@@ -675,17 +728,33 @@ class GaussianModel:
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
                 self._offset = optimizable_tensors["offset"]
                 self._opacity = optimizable_tensors["opacity"]
+
+        # Apply shrinking to old anchors
+        if anchors_to_shrink_mask.any():
+            with torch.no_grad():
+                decay_factor = 1.6
+                log_decay = torch.log(torch.tensor(decay_factor, device="cuda"))
+
+                # Pad mask to match current scaling shape (handling new anchors added during loop)
+                current_len = self._scaling.shape[0]
+                mask_len = anchors_to_shrink_mask.shape[0]
+                if current_len > mask_len:
+                    padding = torch.zeros(current_len - mask_len, dtype=torch.bool, device="cuda")
+                    anchors_to_shrink_mask = torch.cat([anchors_to_shrink_mask, padding])
+
+                # Only shrink Base Scale (last 3 dims)
+                self._scaling[anchors_to_shrink_mask, 3:] -= log_decay
                 
 
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
+    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, scene_extent=1.0, percent_dense=0.01):
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
         
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        self.anchor_growing(grads_norm, grad_threshold, offset_mask, scene_extent, percent_dense)
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
