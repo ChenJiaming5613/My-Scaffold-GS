@@ -718,12 +718,12 @@ class GaussianModel:
         color_trigger_mask = color_var_anchor_mask.unsqueeze(1).repeat(1, self.n_offsets).view(-1)
         color_trigger_mask = torch.logical_and(color_trigger_mask, offset_mask)
 
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask, color_trigger_mask=color_trigger_mask)
-
         # reset color variance stats for anchors that triggered densification
         if color_var_anchor_mask.any():
             self.color_var_accum[color_var_anchor_mask] = 0
             self.color_var_count[color_var_anchor_mask] = 0
+
+        self.anchor_growing(grads_norm, grad_threshold, offset_mask, color_trigger_mask=color_trigger_mask)
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
