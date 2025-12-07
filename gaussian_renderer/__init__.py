@@ -80,6 +80,13 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             color = pc.get_color_mlp(cat_local_view_wodist)
     color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask]
 
+    if is_training and pc.n_offsets > 1:
+        with torch.no_grad():
+            temp_color = color.view(anchor.shape[0], pc.n_offsets, 3)
+            color_var = torch.var(temp_color, dim=1).mean(dim=1, keepdim=True)
+            pc.color_var_accum[visible_mask] += color_var
+            pc.color_var_count[visible_mask] += 1
+
     # get offset's cov
     if pc.add_cov_dist:
         scale_rot = pc.get_cov_mlp(cat_local_view)

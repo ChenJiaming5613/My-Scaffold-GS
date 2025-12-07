@@ -89,6 +89,8 @@ class GaussianModel:
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
+        self.color_var_accum = torch.empty(0)
+        self.color_var_count = torch.empty(0)
                 
         self.optimizer = None
         self.percent_dense = 0
@@ -270,6 +272,9 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        # initialize color variance stats for anchors
+        self.color_var_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.color_var_count = torch.zeros_like(self.color_var_accum)
 
 
     def training_setup(self, training_args):
@@ -280,6 +285,8 @@ class GaussianModel:
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.color_var_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.color_var_count = torch.zeros_like(self.color_var_accum)
 
         
         
@@ -577,9 +584,13 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        # prune color variance stats to keep alignment
+        if self.color_var_accum.shape[0] == mask.shape[0]:
+            self.color_var_accum = self.color_var_accum[valid_points_mask]
+            self.color_var_count = self.color_var_count[valid_points_mask]
 
     
-    def anchor_growing(self, grads, threshold, offset_mask):
+    def anchor_growing(self, grads, threshold, offset_mask, color_trigger_mask=None):
         ## 
         init_length = self.get_anchor.shape[0]*self.n_offsets
         for i in range(self.update_depth):
@@ -589,10 +600,17 @@ class GaussianModel:
             candidate_mask = (grads >= cur_threshold)
             candidate_mask = torch.logical_and(candidate_mask, offset_mask)
             
+            # add anchors whose color variance is consistently high
+            if color_trigger_mask is not None:
+                candidate_mask = torch.logical_or(candidate_mask, color_trigger_mask)
+
             # random pick
             rand_mask = torch.rand_like(candidate_mask.float())>(0.5**(i+1))
             rand_mask = rand_mask.cuda()
-            candidate_mask = torch.logical_and(candidate_mask, rand_mask)
+            if color_trigger_mask is None:
+                candidate_mask = torch.logical_and(candidate_mask, rand_mask)
+            else:
+                candidate_mask = torch.logical_or(torch.logical_and(candidate_mask, rand_mask), color_trigger_mask)
             
             length_inc = self.get_anchor.shape[0]*self.n_offsets - init_length
             if length_inc == 0:
@@ -666,6 +684,14 @@ class GaussianModel:
                 del self.opacity_accum
                 self.opacity_accum = temp_opacity_accum
 
+                # expand color variance stats for new anchors
+                temp_color_var_accum = torch.cat([self.color_var_accum, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+                del self.color_var_accum
+                self.color_var_accum = temp_color_var_accum
+                temp_color_var_count = torch.cat([self.color_var_count, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+                del self.color_var_count
+                self.color_var_count = temp_color_var_count
+
                 torch.cuda.empty_cache()
                 
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -678,14 +704,26 @@ class GaussianModel:
                 
 
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
+    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, color_var_threshold=0.02):
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
-        
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+
+        # color variance based densification trigger
+        color_var_avg = self.color_var_accum / self.color_var_count.clamp(min=1.0)
+        color_var_anchor_mask = (self.color_var_count.squeeze(dim=1) > 0) & (color_var_avg.squeeze(dim=1) > color_var_threshold)
+        # map to offset-level mask to share the same shape as grads_norm
+        color_trigger_mask = color_var_anchor_mask.unsqueeze(1).repeat(1, self.n_offsets).view(-1)
+        color_trigger_mask = torch.logical_and(color_trigger_mask, offset_mask)
+
+        self.anchor_growing(grads_norm, grad_threshold, offset_mask, color_trigger_mask=color_trigger_mask)
+
+        # reset color variance stats for anchors that triggered densification
+        if color_var_anchor_mask.any():
+            self.color_var_accum[color_var_anchor_mask] = 0
+            self.color_var_count[color_var_anchor_mask] = 0
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
